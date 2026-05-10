@@ -27,7 +27,13 @@ export interface RateLimitStatus {
 /**
  * Get the client IP address from the request.
  * Cloudflare Workers provide the client IP in cf-connecting-ip header.
- * Returns 'unknown' if no IP headers are found - callers should handle this case.
+ * Returns 'unknown' if no trustworthy IP header is found — callers should
+ * handle this case (e.g. fail-closed for security-sensitive rate limiting).
+ *
+ * SECURITY: x-forwarded-for and x-real-ip are NOT used because they can be
+ * spoofed by clients. On Supabase Edge Functions (no Cloudflare), there is
+ * no trustworthy IP header, so we return 'unknown' rather than trusting
+ * client-controlled headers.
  */
 export function getClientIP(c: Context): string {
   // Cloudflare Workers provide the real client IP
@@ -35,20 +41,11 @@ export function getClientIP(c: Context): string {
   if (cfConnectingIp)
     return cfConnectingIp
 
-  // Fallback to x-forwarded-for (less reliable but common)
-  const forwardedFor = c.req.header('x-forwarded-for')
-  if (forwardedFor) {
-    // Take the first IP in the chain (original client)
-    return forwardedFor.split(',')[0].trim()
-  }
-
-  // Fallback to x-real-ip
-  const realIp = c.req.header('x-real-ip')
-  if (realIp)
-    return realIp
-
-  // If no IP headers found, return unknown
-  // Note: In production behind Cloudflare, cf-connecting-ip should always be present
+  // No trustworthy IP source outside Cloudflare — return 'unknown'
+  // so callers can fail-closed for security-sensitive operations.
+  // Previously x-forwarded-for / x-real-ip were used as fallbacks,
+  // but those headers are client-controlled and trivially spoofable,
+  // making IP-based rate limiting completely ineffective.
   return 'unknown'
 }
 
@@ -89,12 +86,17 @@ function buildResetAt() {
 export async function isIPRateLimited(c: Context): Promise<RateLimitStatus> {
   const ip = getClientIP(c)
   if (ip === 'unknown') {
-    // Log warning but don't block - in production behind Cloudflare this shouldn't happen
+    // SECURITY: When no trustworthy IP is available (e.g. running on
+    // Supabase Edge Functions without Cloudflare), fail closed for
+    // security-sensitive rate limiting to prevent brute-force bypass.
     cloudlog({
       requestId: c.get('requestId'),
-      message: 'Rate limit check skipped: unknown IP (missing cf-connecting-ip header)',
+      message: 'Rate limit enforced with unknown IP: no trustworthy IP header (missing cf-connecting-ip)',
     })
-    return { limited: false }
+    // Return limited=true with a short window so legitimate requests
+    // behind Cloudflare are never affected (cf-connecting-ip is always set),
+    // but spoofed requests without Cloudflare IP are blocked.
+    return { limited: true, resetAt: Date.now() + 60 * 1000 }
   }
 
   const cacheHelper = new CacheHelper(c)
